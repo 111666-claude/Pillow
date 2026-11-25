@@ -51,6 +51,10 @@ Two new image processing operations are available in ImageOps.
 * :py:meth:`~PIL.ImageOps.neon`: apply a neon glow effect, with arguments for color and
   alpha
 
+The Sobel edge detection used by :py:meth:`~PIL.ImageOps.neon` is implemented with
+:py:meth:`~PIL.Image.Image.filter` rather than a Python loop over pixels, so it scales
+well to large images.
+
 Other changes
 =============
 

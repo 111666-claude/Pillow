@@ -719,32 +719,48 @@ def sepia(image: Image.Image) -> Image.Image:
     )
 
 
+# Sobel kernels, in image order. These are convolved with the image via
+# ImageFilter.Kernel, which flips kernels vertically, hence the reversed rows.
+_SOBEL_KERNELS = (
+    ((-1, 0, 1), (-2, 0, 2), (-1, 0, 1)),
+    ((1, 2, 1), (0, 0, 0), (-1, -2, -1)),
+)
+
+
 def _sobel(image: Image.Image) -> Image.Image:
     if image.mode != "L":
         image = image.convert("L")
 
-    Kx = [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]
-    Ky = [[1, 2, 1], [0, 0, 0], [-1, -2, -1]]
-
+    width, height = image.size
     out = Image.new("L", image.size)
+    if width < 3 or height < 3:
+        # No interior pixels, so the whole image is border.
+        return out
 
-    for x in range(1, image.width - 1):
-        for y in range(1, image.height - 1):
+    from . import ImageMath
 
-            gx = gy = 0.0
+    # Filtering must happen in "I" mode so that the negative kernel weights
+    # are not clamped. The magnitudes are only clipped to [0, 255] after the
+    # two gradients have been summed, which matches the reference Sobel
+    # implementation.
+    grayscale = image.convert("I")
+    gradients = [
+        grayscale.filter(
+            ImageFilter.Kernel(
+                (3, 3), [v for row in reversed(kernel) for v in row], scale=1
+            )
+        )
+        for kernel in _SOBEL_KERNELS
+    ]
+    magnitude = ImageMath.lambda_eval(
+        lambda args: abs(args["gx"]) + abs(args["gy"]),
+        gx=gradients[0],
+        gy=gradients[1],
+    )
 
-            for dy in (-1, 0, 1):
-                for dx in (-1, 0, 1):
-                    v = image.getpixel((x + dx, y + dy))
-                    assert isinstance(v, (int, float))
-
-                    gx += v * Kx[dy + 1][dx + 1]
-                    gy += v * Ky[dy + 1][dx + 1]
-
-            # Approximate gradient magnitude and clamp to [0, 255]
-            mag = int(min(255, abs(gx) + abs(gy)))
-            out.putpixel((x, y), mag)
-
+    # "I" to "L" conversion saturates the values to [0, 255].
+    interior = magnitude.crop((1, 1, width - 1, height - 1)).convert("L")
+    out.paste(interior, (1, 1))
     return out
 
 

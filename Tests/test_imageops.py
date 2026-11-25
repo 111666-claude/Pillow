@@ -735,3 +735,100 @@ def test_palette_histogram_operation_not_supported() -> None:
     im = hopper("P")
     with pytest.raises(NotImplementedError, match="mode P support coming soon"):
         ImageOps.autocontrast(im)
+
+
+def _reference_sobel(image: Image.Image) -> Image.Image:
+    """Straightforward per-pixel Sobel reference, used to validate _sobel()."""
+    if image.mode != "L":
+        image = image.convert("L")
+
+    Kx = [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]
+    Ky = [[1, 2, 1], [0, 0, 0], [-1, -2, -1]]
+
+    width, height = image.size
+    pixels = image.tobytes()
+    out = Image.new("L", image.size)
+    for x in range(1, width - 1):
+        for y in range(1, height - 1):
+            gx = gy = 0.0
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    v = pixels[(y + dy) * width + x + dx]
+                    gx += v * Kx[dy + 1][dx + 1]
+                    gy += v * Ky[dy + 1][dx + 1]
+            out.putpixel((x, y), int(min(255, abs(gx) + abs(gy))))
+    return out
+
+
+def _sobel_sample() -> Image.Image:
+    return Image.frombytes(
+        "L",
+        (32, 32),
+        bytes(
+            (x * 73 + y * 151 + x * y * 7) & 0xFF for y in range(32) for x in range(32)
+        ),
+    )
+
+
+@pytest.mark.parametrize("mode", ("L", "RGB", "RGBA"))
+def test_sobel_matches_reference(mode: str) -> None:
+    source = _sobel_sample()
+    im = source if mode == "L" else source.convert(mode)
+
+    result = ImageOps._sobel(im)
+    expected = _reference_sobel(im)
+
+    assert result.mode == "L"
+    assert result.size == im.size
+    assert_image_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "transpose",
+    (
+        Image.Transpose.ROTATE_90,
+        Image.Transpose.ROTATE_180,
+        Image.Transpose.TRANSPOSE,
+        Image.Transpose.FLIP_TOP_BOTTOM,
+    ),
+)
+def test_sobel_transposed(transpose: Image.Transpose) -> None:
+    im = _sobel_sample().transpose(transpose)
+
+    result = ImageOps._sobel(im)
+
+    assert_image_equal(result, _reference_sobel(im))
+
+
+@pytest.mark.parametrize(
+    "size", ((0, 0), (0, 5), (5, 0), (1, 1), (2, 2), (2, 9), (9, 2))
+)
+def test_sobel_small(size: tuple[int, int]) -> None:
+    im = Image.new("L", size, 128)
+
+    result = ImageOps._sobel(im)
+
+    assert result.mode == "L"
+    assert result.size == size
+    assert not result.getbbox()
+
+
+def test_sobel_border_is_zero() -> None:
+    im = Image.new("RGB", (16, 12), (255, 255, 255))
+
+    result = ImageOps._sobel(im)
+
+    assert not result.getbbox()
+
+
+@pytest.mark.parametrize("alpha", (0.0, 0.2, 0.5, 1.0))
+def test_neon_alpha(alpha: float) -> None:
+    im = _sobel_sample().convert("RGB")
+
+    result = ImageOps.neon(im, alpha=alpha)
+
+    assert result.mode == "RGB"
+    assert result.size == im.size
+    if alpha == 0.0:
+        assert_image_equal(result, im)
+    assert result.getbbox()
