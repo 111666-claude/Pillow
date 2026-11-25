@@ -131,3 +131,19 @@ not bundled into the wheels, so the system zlib was used at runtime instead, and
 Pillow 13.0.0 also failed to import on systems where ``libz.so.1`` was not on the
 default library search path, such as NixOS. Linux wheels no longer require a
 system zlib, and gain the speed of zlib-ng as macOS and Windows wheels already did.
+
+BLP2 DXT images that are not a multiple of four pixels
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+BLP2 images using DXT1, DXT3 or DXT5 compression with a width or height that is
+not a multiple of four were decoded incorrectly. The pixels that pad the last
+block of each row were decoded as if they were part of the image, shifting the
+following rows out of place. Only the pixels inside the image are now kept, and
+data outside the mipmap is no longer read.
+
+DXT3 and DXT5 images without an alpha channel now also decode to the correct
+RGB values, instead of interleaving the alpha bytes that those formats decode
+to with the colour channels.
+
+A truncated DXT mipmap, or a BLP image with a zero width or height, now raises
+an error instead of returning incomplete data.

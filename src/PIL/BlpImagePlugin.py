@@ -43,6 +43,7 @@ from . import Image, ImageFile
 
 TYPE_CHECKING = False
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from typing import IO
 
 
@@ -66,12 +67,17 @@ def unpack_565(i: int) -> tuple[int, int, int]:
     return ((i >> 11) & 0x1F) << 3, ((i >> 5) & 0x3F) << 2, (i & 0x1F) << 3
 
 
-def decode_dxt1(
-    data: bytes, alpha: bool = False
-) -> tuple[bytearray, bytearray, bytearray, bytearray]:
+DecodedBlock = tuple[bytearray, bytearray, bytearray, bytearray]
+
+
+def decode_dxt1(data: bytes, alpha: bool = False) -> DecodedBlock:
     """
     input: one "row" of data (i.e. will produce 4*width pixels)
     """
+
+    if len(data) % 8:
+        msg = "DXT1 data is not a whole number of blocks"
+        raise ValueError(msg)
 
     blocks = len(data) // 8  # number of blocks in row
     ret = (bytearray(), bytearray(), bytearray(), bytearray())
@@ -123,10 +129,14 @@ def decode_dxt1(
     return ret
 
 
-def decode_dxt3(data: bytes) -> tuple[bytearray, bytearray, bytearray, bytearray]:
+def decode_dxt3(data: bytes) -> DecodedBlock:
     """
     input: one "row" of data (i.e. will produce 4*width pixels)
     """
+
+    if len(data) % 16:
+        msg = "DXT3 data is not a whole number of blocks"
+        raise ValueError(msg)
 
     blocks = len(data) // 16  # number of blocks in row
     ret = (bytearray(), bytearray(), bytearray(), bytearray())
@@ -176,10 +186,14 @@ def decode_dxt3(data: bytes) -> tuple[bytearray, bytearray, bytearray, bytearray
     return ret
 
 
-def decode_dxt5(data: bytes) -> tuple[bytearray, bytearray, bytearray, bytearray]:
+def decode_dxt5(data: bytes) -> DecodedBlock:
     """
     input: one "row" of data (i.e. will produce 4 * width pixels)
     """
+
+    if len(data) % 16:
+        msg = "DXT5 data is not a whole number of blocks"
+        raise ValueError(msg)
 
     blocks = len(data) // 16  # number of blocks in row
     ret = (bytearray(), bytearray(), bytearray(), bytearray())
@@ -279,6 +293,9 @@ class BlpImageFile(ImageFile.ImageFile):
             self.fp.seek(1, os.SEEK_CUR)  # mips
 
         self._size = struct.unpack("<II", self.fp.read(8))
+        if not self._size[0] or not self._size[1]:
+            msg = f"Invalid BLP image size {self._size}"
+            raise BLPFormatError(msg)
 
         args: tuple[int, int, bool] | tuple[int, int, bool, int]
         if self.magic == b"BLP1":
@@ -402,27 +419,48 @@ class BLP2Decoder(_BLPBaseDecoder):
                 data = self._read_bgra(palette, alpha)
 
             elif _encoding == Encoding.DXT:
-                data = bytearray()
+                decode: Callable[[bytes], DecodedBlock]
                 if _alpha_encoding == AlphaEncoding.DXT1:
-                    linesize = (self.state.xsize + 3) // 4 * 8
-                    for yb in range((self.state.ysize + 3) // 4):
-                        for d in decode_dxt1(self._safe_read(linesize), alpha):
-                            data += d
+                    blocksize = 8
+                    # decode_dxt1() only emits alpha when asked to
+                    decoded_pixelsize = 4 if alpha else 3
+
+                    def decode(row: bytes) -> DecodedBlock:
+                        return decode_dxt1(row, alpha)
 
                 elif _alpha_encoding == AlphaEncoding.DXT3:
-                    linesize = (self.state.xsize + 3) // 4 * 16
-                    for yb in range((self.state.ysize + 3) // 4):
-                        for d in decode_dxt3(self._safe_read(linesize)):
-                            data += d
-
+                    blocksize = 16
+                    decode = decode_dxt3
+                    decoded_pixelsize = 4
                 elif _alpha_encoding == AlphaEncoding.DXT5:
-                    linesize = (self.state.xsize + 3) // 4 * 16
-                    for yb in range((self.state.ysize + 3) // 4):
-                        for d in decode_dxt5(self._safe_read(linesize)):
-                            data += d
+                    blocksize = 16
+                    decode = decode_dxt5
+                    decoded_pixelsize = 4
                 else:
                     msg = f"Unsupported alpha encoding {repr(_alpha_encoding)}"
                     raise BLPFormatError(msg)
+
+                pixelsize = 4 if alpha else 3
+
+                # Each block holds 4x4 pixels, so an image whose width or
+                # height is not a multiple of four has padding in its blocks.
+                # Read a whole row of blocks at a time and keep only the pixels
+                # inside the image, otherwise the padding would skew the rows.
+                blocks_per_row = (self.state.xsize + 3) // 4
+                blocks_per_column = (self.state.ysize + 3) // 4
+                rowsize = self.state.xsize * decoded_pixelsize
+                data = bytearray()
+                for yb in range(blocks_per_column):
+                    # A whole row of blocks is read at once, so that padding at
+                    # the right edge is skipped rather than decoded as pixels.
+                    rows = decode(self._safe_read(blocks_per_row * blocksize))
+                    for d in rows[: self.state.ysize - yb * 4]:
+                        d = d[:rowsize]
+                        if decoded_pixelsize != pixelsize:
+                            # The image has no alpha channel, so drop the alpha
+                            # bytes that DXT3 and DXT5 always decode to.
+                            del d[3::4]
+                        data += d
             else:
                 msg = f"Unknown BLP encoding {repr(_encoding)}"
                 raise BLPFormatError(msg)
