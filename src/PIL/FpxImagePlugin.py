@@ -74,20 +74,91 @@ class FpxImageFile(ImageFile.ImageFile):
 
         self._open_index(1)
 
+    def _validate_property_set(self, path: list[str]) -> None:
+        # Parse just enough of the OLE property set to make sure no vector
+        # property claims more elements than the stream could contain.
+        # olefile's getproperties() trusts the count and loops over every
+        # element, so an inflated value can hang the decoder.
+        data = self.ole.openstream(path).read()
+
+        if len(data) < 48:
+            msg = "truncated Image Contents property set"
+            raise OSError(msg)
+
+        section_count = i32(data, 24)
+        if section_count <= 0 or 28 + section_count * 20 > len(data):
+            msg = "invalid property set section count"
+            raise OSError(msg)
+
+        for section_index in range(section_count):
+            locator = 28 + section_index * 20
+            section_offset = i32(data, locator + 16)
+            if section_offset + 8 > len(data):
+                msg = "invalid property section offset"
+                raise OSError(msg)
+
+            section_size = i32(data, section_offset)
+            section_end = section_offset + section_size
+            if section_size <= 8 or section_end > len(data):
+                msg = "invalid property section size"
+                raise OSError(msg)
+
+            property_count = i32(data, section_offset + 4)
+            directory_end = section_offset + 8 + property_count * 8
+            if property_count <= 0 or directory_end > section_end:
+                msg = "invalid property count"
+                raise OSError(msg)
+
+            for property_index in range(property_count):
+                entry = section_offset + 8 + property_index * 8
+                value_offset = i32(data, entry + 4)
+                if value_offset >= section_size - 4:
+                    msg = "invalid property value offset"
+                    raise OSError(msg)
+
+                property_type = i32(data, section_offset + value_offset)
+                if property_type & 0x1000:  # VT_VECTOR
+                    # The element count is the first 32-bit value; every
+                    # element needs at least one byte within the section.
+                    count_offset = section_offset + value_offset + 4
+                    if count_offset + 4 > section_end:
+                        msg = "truncated vector property"
+                        raise OSError(msg)
+                    element_count = i32(data, count_offset)
+                    if element_count > section_end - count_offset - 4:
+                        msg = "vector property extends past the property set"
+                        raise OSError(msg)
+
     def _open_index(self, index: int = 1) -> None:
         #
         # get the Image Contents Property Set
 
-        prop = self.ole.getproperties(
-            [f"Data Object Store {index:06d}", "\005Image Contents"]
-        )
+        property_path = [f"Data Object Store {index:06d}", "\005Image Contents"]
+
+        # Validate the property set before handing it to olefile: a malformed
+        # vector count can make olefile's parser loop for a very long time.
+        self._validate_property_set(property_path)
+
+        prop = self.ole.getproperties(property_path)
 
         # size (highest resolution)
 
-        assert isinstance(prop[0x1000002], int)
-        assert isinstance(prop[0x1000003], int)
-        self._size = prop[0x1000002], prop[0x1000003]
+        width = prop.get(0x1000002)
+        height = prop.get(0x1000003)
+        if not isinstance(width, int) or not isinstance(height, int):
+            msg = "invalid image size"
+            raise OSError(msg)
+        # Values are read as unsigned 32-bit integers, so a negative field
+        # shows up as a very large number; reject anything outside the range
+        # of a sensible positive dimension.
+        if not 0 < width <= 0x7FFFFFFF or not 0 < height <= 0x7FFFFFFF:
+            msg = "image dimensions must be positive"
+            raise OSError(msg)
 
+        # Reject absurdly large declared dimensions before they can drive
+        # allocations or tile-grid calculations.
+        Image._decompression_bomb_check((width, height), error_only=True)
+        self._size = width, height
         size = max(self.size)
         i = 1
         while size > 64:
@@ -103,16 +174,25 @@ class FpxImageFile(ImageFile.ImageFile):
 
         id = self.maxid << 16
 
-        s = prop[0x2000002 | id]
+        s = prop.get(0x2000002 | id)
 
-        if not isinstance(s, bytes) or (bands := i32(s, 4)) > 4:
+        if not isinstance(s, bytes) or len(s) < 8:
+            msg = "invalid colour space descriptor"
+            raise OSError(msg)
+
+        bands = i32(s, 4)
+        if bands <= 0 or bands > 4 or len(s) < 8 + bands * 4:
             msg = "Invalid number of bands"
             raise OSError(msg)
 
         # note: for now, we ignore the "uncalibrated" flag
         colors = tuple(i32(s, 8 + i * 4) & 0x7FFFFFFF for i in range(bands))
 
-        self._mode, self.rawmode = MODES[colors]
+        try:
+            self._mode, self.rawmode = MODES[colors]
+        except KeyError as e:
+            msg = "unsupported colour space"
+            raise OSError(msg) from e
 
         # load JPEG tables, if any
         self.jpeg = {}
@@ -134,15 +214,19 @@ class FpxImageFile(ImageFile.ImageFile):
         ]
 
         fp = self.ole.openstream(stream)
+        stream_size = self.ole.get_size(stream)
 
         # skip prefix
         fp.read(28)
 
         # header stream
         s = fp.read(36)
+        if len(s) < 36:
+            msg = "subimage header is truncated"
+            raise OSError(msg)
 
         size = i32(s, 4), i32(s, 8)
-        # tilecount = i32(s, 12)
+        tilecount = i32(s, 12)
         xtile, ytile = i32(s, 16), i32(s, 20)
         if xtile != 64 or ytile != 64:
             msg = "Tile must be 64 pixels by 64 pixels"
@@ -156,15 +240,53 @@ class FpxImageFile(ImageFile.ImageFile):
             msg = "subimage mismatch"
             raise OSError(msg)
 
+        xsize, ysize = size
+
+        # The tile directory is a fixed-size array of "tilecount" entries of
+        # "length" bytes, located at "offset" within the header stream.
+        # Validate every field before using it so that a malformed file can
+        # neither drive an oversized read nor walk past the stream.
+        if tilecount <= 0:
+            msg = "invalid tile count"
+            raise OSError(msg)
+        if length < 16:
+            # entries are indexed at offsets 0, 8, 12, 14 and 15
+            msg = "invalid tile entry length"
+            raise OSError(msg)
+        if offset < 36:
+            msg = "tile directory overlaps the subimage header"
+            raise OSError(msg)
+
+        directory_position = 28 + offset
+        if directory_position > stream_size:
+            msg = "tile directory starts past the subimage header"
+            raise OSError(msg)
+
+        directory_size = tilecount * length
+        if directory_position + directory_size > stream_size:
+            msg = "tile directory extends past the subimage header"
+            raise OSError(msg)
+
+        # The declared tile count must match the grid implied by the
+        # subimage dimensions and the 64x64 tile size (edge tiles may cover
+        # fewer pixels, but still occupy a grid cell).
+        grid_x = (xsize + xtile - 1) // xtile
+        grid_y = (ysize + ytile - 1) // ytile
+        if tilecount != grid_x * grid_y:
+            msg = "tile count does not match the image grid"
+            raise OSError(msg)
+
         # get tile descriptors
         fp.seek(28 + offset)
-        s = fp.read(i32(s, 12) * length)
+        s = fp.read(directory_size)
+        if len(s) < directory_size:
+            msg = "tile directory is truncated"
+            raise OSError(msg)
 
         x = y = 0
-        xsize, ysize = size
         self.tile = []
 
-        for i in range(0, len(s), length):
+        for i in range(0, directory_size, length):
             x1 = min(xsize, x + xtile)
             y1 = min(ysize, y + ytile)
 
@@ -223,7 +345,11 @@ class FpxImageFile(ImageFile.ImageFile):
                 # data must be placed in the tile descriptor itself!
 
                 if jpeg_tables:
-                    self.tile_prefix = self.jpeg[jpeg_tables]
+                    try:
+                        self.tile_prefix = self.jpeg[jpeg_tables]
+                    except KeyError as e:
+                        msg = "missing JPEG tables"
+                        raise OSError(msg) from e
 
             else:
                 msg = "unknown/invalid compression"
