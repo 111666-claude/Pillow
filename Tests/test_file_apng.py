@@ -230,8 +230,158 @@ def test_apng_blend() -> None:
     with Image.open("Tests/images/apng/blend_op_over_near_transparent.png") as im:
         assert isinstance(im, PngImagePlugin.PngImageFile)
         im.seek(im.n_frames - 1)
-        assert im.getpixel((0, 0)) == (0, 255, 0, 97)
+        # The frame is almost transparent, but it is composited with OP_OVER
+        # onto an opaque green canvas, so the result is opaque too.
+        assert im.getpixel((0, 0)) == (0, 255, 0, 255)
         assert im.getpixel((64, 32)) == (0, 255, 0, 255)
+
+
+def test_apng_blend_op_over_alpha() -> None:
+    # An opaque red strip on the left, transparent on the right, and a
+    # half-transparent blue square at offset (3, 3) blended with OP_OVER.
+    with Image.open("Tests/images/apng/blend_op_over_alpha.png") as im:
+        assert isinstance(im, PngImagePlugin.PngImageFile)
+        assert im.mode == "RGBA"
+        assert im.n_frames == 2
+
+        im.seek(0)
+        assert im.getpixel((0, 0)) == (255, 0, 0, 255)
+        assert im.getpixel((7, 7)) == (0, 0, 0, 0)
+
+        im.seek(1)
+        assert im.info["bbox"] == (3, 3, 8, 8)
+        # Outside the frame, including the clipped edge, is unchanged
+        assert im.getpixel((0, 0)) == (255, 0, 0, 255)
+        assert im.getpixel((2, 2)) == (255, 0, 0, 255)
+        assert im.getpixel((0, 7)) == (255, 0, 0, 255)
+        # Blended over opaque red: the result is opaque, half red half blue
+        assert im.getpixel((3, 3)) == (127, 0, 128, 255)
+        assert im.getpixel((4, 4)) == (127, 0, 128, 255)
+        # Blended over a transparent target: the source is kept as it is
+        assert im.getpixel((5, 5)) == (0, 0, 255, 128)
+        assert im.getpixel((7, 7)) == (0, 0, 255, 128)
+
+
+def test_apng_blend_op_over_alpha_la() -> None:
+    # The same layout as blend_op_over_alpha.png, but with an LA canvas.
+    with Image.open("Tests/images/apng/blend_op_over_alpha_la.png") as im:
+        assert isinstance(im, PngImagePlugin.PngImageFile)
+        assert im.mode == "LA"
+        assert im.n_frames == 2
+
+        im.seek(0)
+        assert im.getpixel((0, 0)) == (200, 255)
+        assert im.getpixel((7, 7)) == (0, 0)
+
+        im.seek(1)
+        assert im.info["bbox"] == (3, 3, 8, 8)
+        assert im.getpixel((0, 0)) == (200, 255)
+        assert im.getpixel((2, 2)) == (200, 255)
+        assert im.getpixel((0, 7)) == (200, 255)
+        # Blended over opaque grey: the result is opaque
+        assert im.getpixel((3, 3)) == (150, 255)
+        assert im.getpixel((4, 4)) == (150, 255)
+        # Blended over a transparent target: the source is kept as it is
+        assert im.getpixel((5, 5)) == (100, 128)
+        assert im.getpixel((7, 7)) == (100, 128)
+
+
+@pytest.mark.parametrize(
+    "filename, expected",
+    (
+        (
+            "blend_op_over_alpha_multi_frame.png",
+            [
+                ((255, 0, 0, 255), (0, 0, 0, 0), (0, 0, 0, 0)),
+                ((127, 128, 0, 255), (0, 0, 0, 0), (0, 0, 0, 0)),
+                ((127, 128, 0, 255), (0, 0, 255, 64), (0, 0, 255, 64)),
+                ((127, 128, 0, 255), (204, 204, 255, 160), (0, 0, 255, 64)),
+                ((10, 20, 30, 40), (204, 204, 255, 160), (0, 0, 255, 64)),
+            ],
+        ),
+        (
+            "blend_op_over_alpha_la_multi_frame.png",
+            [
+                ((200, 255), (0, 0), (0, 0)),
+                ((150, 255), (0, 0), (0, 0)),
+                ((150, 255), (50, 64), (50, 64)),
+                ((150, 255), (210, 160), (50, 64)),
+                ((10, 40), (210, 160), (50, 64)),
+            ],
+        ),
+    ),
+)
+def test_apng_blend_op_over_alpha_multiple_frames(
+    filename: str, expected: list[tuple[tuple[int, ...], ...]]
+) -> None:
+    # Each frame blends with OP_OVER, except the last, which overwrites with
+    # OP_SOURCE. The sampled pixels are (0, 0), (4, 4) and (7, 7).
+    pixels = ((0, 0), (4, 4), (7, 7))
+    with Image.open("Tests/images/apng/" + filename) as im:
+        assert isinstance(im, PngImagePlugin.PngImageFile)
+        assert im.n_frames == len(expected)
+        for frame, frame_expected in enumerate(expected):
+            im.seek(frame)
+            assert [im.getpixel(xy) for xy in pixels] == list(frame_expected)
+
+
+@pytest.mark.parametrize(
+    "filename",
+    (
+        "blend_op_over_alpha.png",
+        "blend_op_over_alpha_multi_frame.png",
+        "blend_op_over_alpha_la.png",
+        "blend_op_over_alpha_la_multi_frame.png",
+    ),
+)
+def test_apng_blend_op_over_alpha_sequential_seek(filename: str) -> None:
+    # Seeking through the frames in order, loading each one, must give the same
+    # pixels as replaying them a second time.
+    with Image.open("Tests/images/apng/" + filename) as im:
+        assert isinstance(im, PngImagePlugin.PngImageFile)
+        first = []
+        for frame in range(im.n_frames):
+            im.seek(frame)
+            im.load()
+            first.append(im.tobytes())
+
+        im.seek(0)
+        second = []
+        for frame in range(im.n_frames):
+            im.seek(frame)
+            second.append(im.tobytes())
+
+    assert first == second
+
+
+def test_apng_save_blend_op_over_alpha(tmp_path: Path) -> None:
+    test_file = tmp_path / "temp.png"
+
+    for mode, opaque, transparent, overlay in (
+        ("RGBA", (255, 0, 0, 255), (0, 0, 0, 0), (0, 0, 255, 128)),
+        ("LA", (200, 255), (0, 0), (100, 128)),
+    ):
+        size = (8, 8)
+        base = Image.new(mode, size, transparent)
+        base.paste(Image.new(mode, (4, 8), opaque), (0, 0))
+        second = base.copy()
+        second.paste(Image.new(mode, (5, 5), overlay), (3, 3))
+
+        base.save(
+            test_file,
+            save_all=True,
+            append_images=[second],
+            disposal=PngImagePlugin.Disposal.OP_NONE,
+            blend=[PngImagePlugin.Blend.OP_SOURCE, PngImagePlugin.Blend.OP_OVER],
+        )
+
+        with Image.open(test_file) as im:
+            assert isinstance(im, PngImagePlugin.PngImageFile)
+            assert im.mode == mode
+            assert im.n_frames == 2
+
+            im.seek(1)
+            assert im.tobytes() == Image.alpha_composite(base, second).tobytes()
 
 
 def test_apng_blend_transparency() -> None:
@@ -301,8 +451,9 @@ def test_apng_mode() -> None:
         assert isinstance(im, PngImagePlugin.PngImageFile)
         assert im.mode == "RGBA"
         im.seek(im.n_frames - 1)
-        assert im.getpixel((0, 0)) == (0, 0, 128, 191)
-        assert im.getpixel((64, 32)) == (0, 0, 128, 191)
+        # The opaque first frame shows through the half-transparent second frame
+        assert im.getpixel((0, 0)) == (0, 0, 128, 255)
+        assert im.getpixel((64, 32)) == (0, 0, 128, 255)
 
     with Image.open("Tests/images/apng/mode_grayscale.png") as im:
         assert isinstance(im, PngImagePlugin.PngImageFile)
@@ -315,8 +466,9 @@ def test_apng_mode() -> None:
         assert isinstance(im, PngImagePlugin.PngImageFile)
         assert im.mode == "LA"
         im.seek(im.n_frames - 1)
-        assert im.getpixel((0, 0)) == (128, 191)
-        assert im.getpixel((64, 32)) == (128, 191)
+        # The opaque first frame shows through the half-transparent second frame
+        assert im.getpixel((0, 0)) == (128, 255)
+        assert im.getpixel((64, 32)) == (128, 255)
 
     with Image.open("Tests/images/apng/mode_palette.png") as im:
         assert isinstance(im, PngImagePlugin.PngImageFile)
