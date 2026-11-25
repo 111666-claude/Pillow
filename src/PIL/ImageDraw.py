@@ -238,17 +238,157 @@ class ImageDraw:
                 for i in range(0, len(xy), 2)
             ]
 
+    @staticmethod
+    def _validate_dash(dash: tuple[int, ...]) -> tuple[int, ...]:
+        """Validate a dash pattern and return it as a tuple.
+
+        Even indexed values are drawn lengths and odd indexed values are
+        gaps.  Every value must be a positive integer so that evaluating
+        the pattern always advances and terminates.
+        """
+        msg = (
+            "dash must be a non-empty tuple of ints; "
+            "dash must be a non-empty tuple of positive ints"
+        )
+        if not isinstance(dash, (tuple, list)) or len(dash) == 0:
+            raise ValueError(msg)
+        if not all(isinstance(value, int) and value > 0 for value in dash):
+            raise ValueError(msg)
+        return tuple(dash)
+
+    def _restrict_lines(
+        self, xy: Sequence[Sequence[float]]
+    ) -> list[list[tuple[float, ...]]]:
+        """Restrict line coordinates to the image using Liang-Barsky clipping.
+
+        Keeping the coordinates bounded prevents the rasterizers from
+        iterating over extremely long off-image segments.  Portions of a
+        connected polyline that stay visible remain in the same returned
+        line so that dash phase continuity is preserved across their
+        corners; a segment that leaves and re-enters the image starts a new
+        line.
+        """
+        w, h = self.im.size
+        if len(xy) == 1 or all(0 <= x <= w and 0 <= y <= h for x, y in xy):
+            return [list(xy)]  # type: ignore[arg-type]
+
+        lines: list[list[tuple[float, ...]]] = []
+        line: list[tuple[float, ...]] = []
+        for (x0, y0), (x1, y1) in zip(xy, xy[1:]):
+            dx = x1 - x0
+            dy = y1 - y0
+
+            u1, u2 = 0.0, 1.0
+            for p, q in (
+                (-dx, x0),  # left side
+                (dx, w - x0),  # right side
+                (-dy, y0),  # top side
+                (dy, h - y0),  # bottom side
+            ):
+                if p == 0:
+                    # Line is parallel to this side
+                    if q < 0:
+                        # and outside of it
+                        break
+                else:
+                    u = q / p
+                    if p < 0:
+                        u1 = max(u1, u)
+                    else:
+                        u2 = min(u2, u)
+
+                    if u1 > u2:
+                        # The line is outside
+                        break
+            else:
+                start = (x0 + dx * u1, y0 + dy * u1)
+                if line and start != line[-1]:
+                    if len(line) == 1:
+                        line *= 2
+                    lines.append(line)
+                    line = []
+                line.append(start)
+
+                end = (x0 + dx * u2, y0 + dy * u2)
+                if end != line[-1]:
+                    line.append(end)
+        if line:
+            lines.append(line)
+        return lines
+
+    # Coordinate span beyond which dashing is clipped in Python first,
+    # rather than relying on the rasterizer to walk every off-image step.
+    _DASH_FAR_LIMIT = 100_000
+
+    def _draw_dashed_polygon(self, xy: Coords, ink: int, dash: tuple[int, ...]) -> None:
+        """Draw a dashed polygon outline with continuous corner phase."""
+        try:
+            points = [(float(x), float(y)) for x, y in self._normalize_coords(xy)]
+        except IndexError:
+            points = []
+
+        if len(points) < 2:
+            # Preserve the canonical coordinate-count exception from C.
+            self.draw.draw_polygon(xy, ink, 0, 1, dash)
+            return
+
+        far = any(
+            abs(x) > self._DASH_FAR_LIMIT or abs(y) > self._DASH_FAR_LIMIT
+            for x, y in points
+        )
+        if not far:
+            for i in range(len(points)):
+                x0, y0 = points[i]
+                x1, y1 = points[(i + 1) % len(points)]
+                if (
+                    abs(x1 - x0) > self._DASH_FAR_LIMIT
+                    or abs(y1 - y0) > self._DASH_FAR_LIMIT
+                ):
+                    far = True
+                    break
+
+        if not far:
+            # Shared C dash offset carries the phase across every edge and
+            # the closing segment.
+            self.draw.draw_polygon(xy, ink, 0, 1, dash)
+            return
+
+        # Extremely long coordinates: clip first so rasterization stays
+        # bounded.  Phase restarts per visible run in this fallback.
+        closed = points + points[:1]
+        for part in self._restrict_lines(closed):
+            if len(part) >= 2:
+                self.draw.draw_lines(part, ink, 1, dash)
+
     def line(
         self,
         xy: Coords,
         fill: _Ink | None = None,
         width: int = 1,
         joint: str | None = None,
+        dash: tuple[int, ...] | None = None,
     ) -> None:
         """Draw a line, or a connected sequence of line segments."""
         ink = self._getink(fill)[0]
-        if ink is not None and width != 0:
-            self.draw.draw_lines(xy, ink, width)
+        if ink is None or width == 0:
+            return
+
+        if dash is not None:
+            dash = self._validate_dash(dash)
+            # Dash patterns are always rendered one pixel wide; width/joint
+            # do not apply to dashed lines.  Restrict to the image bounds so
+            # that extremely long off-image segments cannot hang.
+            for dash_line in self._restrict_lines(self._normalize_coords(xy)):
+                self.draw.draw_lines(dash_line, ink, 1, dash)
+        else:
+            if width == 1:
+                # Clip to the image bounds so extremely long off-image
+                # segments do not make the rasterizer iterate billions of
+                # steps.  In-bounds coordinates take an unchanged path.
+                for line_part in self._restrict_lines(self._normalize_coords(xy)):
+                    self.draw.draw_lines(line_part, ink, width)
+            else:
+                self.draw.draw_lines(xy, ink, width)
             if joint == "curve" and width > 4:
                 points = self._normalize_coords(xy)
                 for i in range(1, len(points) - 1):
@@ -350,23 +490,30 @@ class ImageDraw:
         fill: _Ink | None = None,
         outline: _Ink | None = None,
         width: int = 1,
+        dash: tuple[int, ...] | None = None,
     ) -> None:
         """Draw a polygon."""
         ink, fill_ink = self._getink(outline, fill)
         if fill_ink is not None:
             self.draw.draw_polygon(xy, fill_ink, 1)
-        if ink is not None and ink != fill_ink and width != 0:
-            if width == 1:
-                self.draw.draw_polygon(xy, ink, 0, width)
-            elif self.im is not None:
-                # To avoid expanding the polygon outwards,
-                # use the fill as a mask
-                mask = Image.new("1", self.im.size)
-                mask_ink = self._getink(1)[0]
-                draw = Draw(mask)
-                draw.draw.draw_polygon(xy, mask_ink, 1)
+        if ink is None or ink == fill_ink or width == 0:
+            return
 
-                self.draw.draw_polygon(xy, ink, 0, width * 2 - 1, mask.im)
+        if dash is not None:
+            dash = self._validate_dash(dash)
+            # Dash outlines are always one pixel wide; width is ignored.
+            self._draw_dashed_polygon(xy, ink, dash)
+        elif width == 1:
+            self.draw.draw_polygon(xy, ink, 0, width)
+        elif self.im is not None:
+            # To avoid expanding the polygon outwards,
+            # use the fill as a mask
+            mask = Image.new("1", self.im.size)
+            mask_ink = self._getink(1)[0]
+            draw = Draw(mask)
+            draw.draw.draw_polygon(xy, mask_ink, 1)
+
+            self.draw.draw_polygon(xy, ink, 0, width * 2 - 1, None, mask.im)
 
     def regular_polygon(
         self,
@@ -387,12 +534,30 @@ class ImageDraw:
         fill: _Ink | None = None,
         outline: _Ink | None = None,
         width: int = 1,
+        dash: tuple[int, ...] | None = None,
     ) -> None:
         """Draw a rectangle."""
         ink, fill_ink = self._getink(outline, fill)
         if fill_ink is not None:
             self.draw.draw_rectangle(xy, fill_ink, 1)
-        if ink is not None and ink != fill_ink and width != 0:
+        if ink is None or ink == fill_ink or width == 0:
+            return
+
+        if dash is not None:
+            dash = self._validate_dash(dash)
+            (x0, y0), (x1, y1) = self._normalize_coords(xy)
+            # Build one closed polyline so that the dash phase continues
+            # across all four corners and the closing edge.
+            corners = [
+                (x0, y0),
+                (x1, y0),
+                (x1, y1),
+                (x0, y1),
+                (x0, y0),
+            ]
+            for dash_line in self._restrict_lines(corners):
+                self.draw.draw_lines(dash_line, ink, 1, dash)
+        else:
             self.draw.draw_rectangle(xy, ink, 0, width)
 
     def rounded_rectangle(

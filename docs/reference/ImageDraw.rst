@@ -290,7 +290,7 @@ Methods
 
         .. versionadded:: 5.3.0
 
-.. py:method:: ImageDraw.line(xy, fill=None, width=1, joint=None)
+.. py:method:: ImageDraw.line(xy, fill=None, width=1, joint=None, dash=None)
 
     Draws a line between the coordinates in the ``xy`` list.
     The coordinate pixels are included in the drawn line.
@@ -306,6 +306,14 @@ Methods
     :param joint: Joint type between a sequence of lines. It can be ``"curve"``, for rounded edges, or :data:`None`.
 
         .. versionadded:: 5.3.0
+    :param dash: An optional dash pattern, given as a tuple of integers.
+        The dash pattern specifies the lengths of alternating drawn and blank segments
+        (e.g. ``(10, 5)`` draws 10 pixels, skips 5, and repeats). The pattern starts
+        with a drawn segment at the first coordinate and the phase continues across
+        connected segments and corners. When ``dash`` is set, ``width`` and ``joint``
+        are ignored.
+
+        .. versionadded:: 13.1.0
 
 .. py:method:: ImageDraw.pieslice(xy, start, end, fill=None, outline=None, width=1)
 
@@ -332,7 +340,7 @@ Methods
                numeric values like ``[x, y, x, y, ...]``.
     :param fill: Color to use for the point.
 
-.. py:method:: ImageDraw.polygon(xy, fill=None, outline=None, width=1)
+.. py:method:: ImageDraw.polygon(xy, fill=None, outline=None, width=1, dash=None)
 
     Draws a polygon.
 
@@ -345,6 +353,13 @@ Methods
     :param fill: Color to use for the fill.
     :param outline: Color to use for the outline.
     :param width: The line width, in pixels.
+    :param dash: An optional dash pattern, given as a tuple of integers.
+        The dash pattern specifies the lengths of alternating drawn and blank
+        segments (e.g. ``(10, 5)`` draws 10 pixels, skips 5, and repeats). The
+        phase continues across every corner, including the closing segment.
+        When ``dash`` is set, ``width`` is ignored.
+
+        .. versionadded:: 13.1.0
 
 
 .. py:method:: ImageDraw.regular_polygon(bounding_circle, n_sides, rotation=0, fill=None, outline=None, width=1)
@@ -365,7 +380,7 @@ Methods
     :param width: The line width, in pixels.
 
 
-.. py:method:: ImageDraw.rectangle(xy, fill=None, outline=None, width=1)
+.. py:method:: ImageDraw.rectangle(xy, fill=None, outline=None, width=1, dash=None)
 
     Draws a rectangle.
 
@@ -377,6 +392,13 @@ Methods
     :param width: The line width, in pixels.
 
         .. versionadded:: 5.3.0
+    :param dash: An optional dash pattern, given as a tuple of integers.
+        The dash pattern specifies the lengths of alternating drawn and blank
+        segments (e.g. ``(10, 5)`` draws 10 pixels, skips 5, and repeats). The
+        rectangle is drawn as one closed polyline, so the phase continues across
+        all four corners. When ``dash`` is set, ``width`` is ignored.
+
+        .. versionadded:: 13.1.0
 
 .. py:method:: ImageDraw.rounded_rectangle(xy, radius=0, fill=None, outline=None, width=1, corners=None)
 
